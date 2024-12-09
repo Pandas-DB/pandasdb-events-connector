@@ -1,0 +1,303 @@
+service: pandasdb-events-connector
+
+provider:
+  name: aws
+  runtime: python3.9
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'eu-west-1'}
+  
+  environment:
+    METADATA_TABLE: ${self:service}-${self:provider.stage}
+    LOCK_TABLE: ${self:service}-events-lock-${self:provider.stage}
+    CHUNK_SIZE: 100000
+    POWERTOOLS_SERVICE_NAME: ${self:service}
+    LOG_LEVEL: INFO
+    DEPLOYMENT_REGION: ${self:provider.region}
+  
+  http:
+    cors: true
+    
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:SendMessageBatch
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:DeleteMessageBatch
+            - sqs:GetQueueAttributes
+          Resource: !GetAtt EventsQueue.Arn
+        - Effect: Allow
+          Action:
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+          Resource: "arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.METADATA_TABLE}"
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:ListBucket
+            - s3:DeleteObject
+            - s3:ListObjects
+            - s3:ListObjectsV2
+            - s3:HeadBucket
+            - s3:CreateMultipartUpload,
+            - s3:CompleteMultipartUpload,
+            - s3:AbortMultipartUpload,
+            - s3:ListMultipartUploadParts,
+            - s3:UploadPart,
+          Resource:
+            - "arn:aws:s3:::df-*"
+            - "arn:aws:s3:::df-*/*"
+        - Effect: Allow
+          Action:
+            - cognito-idp:AdminInitiateAuth
+            - cognito-idp:AdminCreateUser
+          Resource: "arn:aws:cognito-idp:${self:provider.region}:*:userpool/*"
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:DeleteItem
+            - dynamodb:UpdateItem
+          Resource: "arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.LOCK_TABLE}"
+
+package:
+  individually: true
+  patterns:
+    - "!node_modules/**"
+    - "!.git/**"
+    - "!.venv/**"
+    - "!__pycache__/**"
+    - "!.pytest_cache/**"
+    - "!test/**"
+    - "!tests/**"
+    - "!*.pyc"
+    - "!.DS_Store"
+    - "!**.sample"
+    - "!layer/**"
+    - "handlers/**/*.py"
+
+layers:
+  dependencies:
+    path: layer
+    description: Required dependencies for data frame processing
+    compatibleRuntimes:
+      - python3.9
+
+functions:
+
+  getAuthConfig:
+    handler: handlers/auth.get_config
+    timeout: 30
+    memorySize: 128
+    package:
+      patterns:
+        - "handlers/auth.py" 
+    layers:
+      - {Ref: DependenciesLambdaLayer}
+    environment:
+      COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+      COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-auth
+    events:
+      - http:
+          path: auth/config
+          method: get
+          cors: true
+
+  verifyToken:
+    handler: handlers/auth.verify_token
+    timeout: 30
+    memorySize: 128
+    package:
+      patterns:
+        - "handlers/auth.py"
+    layers:
+      - {Ref: DependenciesLambdaLayer}
+    environment:
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-auth
+    events:
+      - http:
+          path: auth/verify
+          method: get
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+          cors: true
+
+  postEvent:
+    handler: handlers/post_event.handler
+    timeout: 30
+    memorySize: 256
+    package:
+      patterns:
+        - "handlers/post_event.py"
+    layers:
+      - { Ref: DependenciesLambdaLayer }
+    environment:
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-events-producer
+      EVENTS_QUEUE_URL: !Ref EventsQueue
+    events:
+      - http:
+          path: events/{event_name}/event-upload
+          method: post
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+          cors: true
+
+  eventQueue:
+    handler: handlers/post_event_queue.handler
+    timeout: 30
+    memorySize: 256
+    package:
+      patterns:
+        - "handlers/post_event_queue.py"
+    layers:
+      - {Ref: DependenciesLambdaLayer}
+    environment:
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-events-producer
+      EVENTS_QUEUE_URL: !Ref EventsQueue
+    events:
+      - http:
+          path: events/{event_name}/event-upload
+          method: post
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+          cors: true
+
+  eventsConsumer:
+    handler: handlers/events_consumer.handler
+    timeout: 300
+    memorySize: 512
+    package:
+      patterns:
+        - "handlers/events_consumer.py"
+    layers:
+      - {Ref: DependenciesLambdaLayer}
+    environment:
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-events-consumer
+      EVENTS_QUEUE_URL: !Ref EventsQueue
+    events:
+      - sqs:
+          arn: !GetAtt EventsQueue.Arn
+          batchSize: 20  # 20 items buffer
+          maximumBatchingWindow: 60  # 1 minute after receiving an event before trigger the next lambda
+          functionResponseType: ReportBatchItemFailures
+          maximumBatchSize: 2097152  # 2MB
+
+resources:
+  Resources:
+    MetadataTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.METADATA_TABLE}
+        AttributeDefinitions:
+          - AttributeName: user_id
+            AttributeType: S
+          - AttributeName: df_path
+            AttributeType: S
+        KeySchema:
+          - AttributeName: user_id
+            KeyType: HASH
+          - AttributeName: df_path
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+        
+    CognitoUserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: ${self:service}-user-pool-${self:provider.stage}
+        
+    CognitoUserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        UserPoolId: !Ref CognitoUserPool
+        ClientName: ${self:service}-client-${self:provider.stage}
+        GenerateSecret: false
+        ExplicitAuthFlows:
+          - ALLOW_USER_PASSWORD_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+          - ALLOW_USER_SRP_AUTH
+        PreventUserExistenceErrors: ENABLED
+          
+    ApiGatewayAuthorizer:
+      Type: AWS::ApiGateway::Authorizer
+      Properties:
+        Name: cognito-authorizer
+        Type: COGNITO_USER_POOLS
+        IdentitySource: method.request.header.Authorization
+        RestApiId: !Ref ApiGatewayRestApi
+        ProviderARNs:
+          - !GetAtt CognitoUserPool.Arn
+
+    GatewayResponseDefault4XX:
+      Type: 'AWS::ApiGateway::GatewayResponse'
+      Properties:
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        ResponseType: DEFAULT_4XX
+        RestApiId: !Ref ApiGatewayRestApi
+        
+    GatewayResponseDefault5XX:
+      Type: 'AWS::ApiGateway::GatewayResponse'
+      Properties:
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        ResponseType: DEFAULT_5XX
+        RestApiId: !Ref ApiGatewayRestApi
+
+    EventsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-events-${self:provider.stage}
+        VisibilityTimeout: 360
+        MessageRetentionPeriod: 1209600  # 14 days
+        ReceiveMessageWaitTimeSeconds: 20
+        MaximumMessageSize: 262144  # 256KB
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt EventsDLQ.Arn
+          maxReceiveCount: 3
+
+    EventsDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-events-dlq-${self:provider.stage}
+        MessageRetentionPeriod: 1209600  # 14 days
+
+    EventsLockTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.LOCK_TABLE}
+        AttributeDefinitions:
+          - AttributeName: lockKey
+            AttributeType: S
+        KeySchema:
+          - AttributeName: lockKey
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        TimeToLiveSpecification:
+          AttributeName: expiresAt
+          Enabled: true
+
+  Outputs:
+    UserPoolId:
+      Value: !Ref CognitoUserPool
+    UserPoolClientId:
+      Value: !Ref CognitoUserPoolClient
+    ApiUrl:
+      Value: !Sub https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}
+    EventsQueueUrl:
+      Value: !Ref EventsQueue
+    EventsQueueArn:
+      Value: !GetAtt EventsQueue.Arn
