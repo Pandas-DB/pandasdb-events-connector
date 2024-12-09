@@ -47,14 +47,14 @@ provider:
             - s3:ListObjects
             - s3:ListObjectsV2
             - s3:HeadBucket
-            - s3:CreateMultipartUpload,
-            - s3:CompleteMultipartUpload,
-            - s3:AbortMultipartUpload,
-            - s3:ListMultipartUploadParts,
-            - s3:UploadPart,
+            - s3:CreateMultipartUpload
+            - s3:CompleteMultipartUpload
+            - s3:AbortMultipartUpload
+            - s3:ListMultipartUploadParts
+            - s3:UploadPart
           Resource:
-            - "arn:aws:s3:::df-*"
-            - "arn:aws:s3:::df-*/*"
+            - "arn:aws:s3:::events-*"
+            - "arn:aws:s3:::events-*/*"
         - Effect: Allow
           Action:
             - cognito-idp:AdminInitiateAuth
@@ -167,7 +167,7 @@ functions:
       EVENTS_QUEUE_URL: !Ref EventsQueue
     events:
       - http:
-          path: events/{event_name}/event-upload
+          path: events/{event_name}/event-queue-upload
           method: post
           authorizer:
             type: COGNITO_USER_POOLS
@@ -190,7 +190,7 @@ functions:
       - sqs:
           arn: !GetAtt EventsQueue.Arn
           batchSize: 20  # 20 items buffer
-          maximumBatchingWindow: 60  # 1 minute after receiving an event before trigger the next lambda
+          maximumBatchingWindow: 30  # 10min after receiving an event before trigger the next lambda
           functionResponseType: ReportBatchItemFailures
           maximumBatchSize: 2097152  # 2MB
 

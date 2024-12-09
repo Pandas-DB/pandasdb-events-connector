@@ -42,7 +42,7 @@ def handler(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, An
 
         path_params = event.get('pathParameters', {})
         # URL decode the key and ensure it has the right extension
-        key = unquote(path_params.get('dataframe_id', ''))
+        key = unquote(path_params.get('event_name', ''))
 
         if not key:
             return create_response(400, {'error': 'Key parameter is required'})
